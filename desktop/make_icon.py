@@ -1,7 +1,7 @@
-"""Generate the placeholder Yoraito icon (build/icon.ico and build/icon.png).
+"""Generate the placeholder Yoraito icon: desktop/assets/icon.ico and desktop/assets/icon.png.
 
-Replace desktop/assets/icon.ico with the real logo when there is one; nothing else needs to change.
-Usage:  python make_icon.py        (needs Pillow)
+The template ships these two files. Replace desktop/assets/icon.ico with the tool's own logo when there is one;
+nothing else needs to change. Usage:  python desktop/make_icon.py        (needs Pillow)
 """
 from pathlib import Path
 

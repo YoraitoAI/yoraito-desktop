@@ -1,12 +1,16 @@
-"""Build the Yoraito Windows installer.  Usage (from the repository root or anywhere):
+"""Build a Yoraito tool's Windows installer. The same file for every tool; it reads tool.json next to it.
 
-    .venv-desktop\\Scripts\\python.exe desktop\\build_desktop.py
+    python desktop/build_desktop.py            (from the tool's repository root, with its Python environment)
 
-Steps: (1) build the React frontend, (2) package the Python backend as a one-folder PyInstaller build,
-(3) package Electron + backend into an NSIS installer, (4) write the SHA-256 checksum.
-The results land in <repository>/release/. Nothing is uploaded or published.
+Steps:
+  1. build the tool's web frontend, if tool.json "build.frontend" names one;
+  2. package the Python backend as a one-folder PyInstaller build (desktop/stage/backend/<id>-backend/);
+  3. write THIRD-PARTY-NOTICES.txt with packaging/third_party_notices.py, if "build.noticesPackage" is set;
+  4. package Electron and the backend into an NSIS installer with electron-builder (config made from tool.json);
+  5. write the installer's SHA-256 checksum and short release notes.
 
-Needs: Node.js + npm, and a Python with the project's dependencies and PyInstaller (see docs/DESKTOP.md).
+Results land in <repository>/release/. Nothing is uploaded or published. Needs Node.js and npm, and a Python with the
+tool's dependencies and PyInstaller (see docs/DESKTOP.md).
 """
 from __future__ import annotations
 
@@ -27,57 +31,118 @@ NPM = "npm.cmd" if sys.platform == "win32" else "npm"
 NPX = "npx.cmd" if sys.platform == "win32" else "npx"
 
 
+def load_tool() -> dict:
+    tool = json.loads((DESKTOP / "tool.json").read_text(encoding="utf-8"))
+    for key in ("name", "id", "appId", "version"):
+        if not tool.get(key):
+            sys.exit(f'tool.json: "{key}" is required')
+    if tool["appId"] == "ai.yoraito.example" and tool["id"] != "yoraito-example":
+        sys.exit('tool.json: set "appId" to this tool\'s own id (e.g. "ai.yoraito.recon"); every tool needs its own')
+    return tool
+
+
 def run(cmd: list[str], cwd: Path, **kw) -> None:
     print(f"\n> {' '.join(cmd)}   (in {cwd})", flush=True)
     subprocess.run(cmd, cwd=str(cwd), check=True, **kw)
 
 
-def build_frontend() -> None:
-    web = ROOT / "webui"
-    if not (web / "node_modules").exists():
-        run([NPM, "ci"], web)
-    run([NPM, "run", "build"], web)
+def build_frontend(tool: dict) -> None:
+    frontend = (tool.get("build") or {}).get("frontend")
+    if not frontend:
+        print("No frontend to build (tool.json build.frontend is empty).")
+        return
+    web = ROOT / frontend["dir"]
+    for command in frontend.get("commands") or [["npm", "ci"], ["npm", "run", "build"]]:
+        command = [NPM if command[0] == "npm" else command[0], *command[1:]]
+        run(command, web)
 
 
-def build_backend() -> None:
+def build_backend(tool: dict) -> None:
     try:
         import PyInstaller  # noqa: F401
     except ImportError:
         sys.exit("PyInstaller is missing in this Python. See docs/DESKTOP.md (build setup).")
+    build = tool.get("build") or {}
+    name = f"{tool['id']}-backend"
     out = STAGE / "backend"
     work = STAGE / "_pyinstaller"
     shutil.rmtree(out, ignore_errors=True)
     shutil.rmtree(work, ignore_errors=True)
-    static_src = ROOT / "src" / "yoraito_model_diff" / "web" / "static"
     cmd = [
         sys.executable, "-m", "PyInstaller",
-        "--name", "yoraito-backend",
+        "--name", name,
         "--onedir", "--noconsole", "--noconfirm", "--clean",
         "--distpath", str(out), "--workpath", str(work), "--specpath", str(work),
-        "--paths", str(ROOT / "src"),
-        # Only the built UI is bundled (never testing/, reviews.db or review_files/).
-        "--add-data", f"{static_src}{os.pathsep}{Path('yoraito_model_diff') / 'web' / 'static'}",
-        "--collect-submodules", "uvicorn",
-        "--hidden-import", "yoraito_model_diff.web.app",
-        "--hidden-import", "yoraito_model_diff.llm",
-        "--hidden-import", "fastapi", "--hidden-import", "multipart", "--hidden-import", "reportlab",
-        "--hidden-import", "duckdb", "--hidden-import", "openpyxl",
+        # tool.json travels with the backend: desktop_entry.py reads its "backend" settings at start.
+        "--add-data", f"{DESKTOP / 'tool.json'}{os.pathsep}.",
         "--icon", str(DESKTOP / "assets" / "icon.ico"),
-        str(DESKTOP / "desktop_entry.py"),
+        # Build and test tools that live in the build environment; the app never imports them.
+        "--exclude-module", "pytest", "--exclude-module", "_pytest", "--exclude-module", "setuptools",
+        "--exclude-module", "pip",
     ]
+    for path in build.get("pythonPaths") or []:
+        cmd += ["--paths", str(ROOT / path)]
+    for source, destination in build.get("addData") or []:
+        cmd += ["--add-data", f"{ROOT / source}{os.pathsep}{destination}"]
+    for module in build.get("hiddenImports") or []:
+        cmd += ["--hidden-import", module]
+    for package in build.get("collectSubmodules") or []:
+        cmd += ["--collect-submodules", package]
+    cmd.append(str(DESKTOP / "desktop_entry.py"))
     run(cmd, ROOT)
-    exe = out / "yoraito-backend" / "yoraito-backend.exe"
+    exe = out / name / (f"{name}.exe" if sys.platform == "win32" else name)
     if not exe.exists():
         sys.exit(f"The backend was not built: {exe} is missing.")
 
 
-def build_installer() -> Path:
+def write_notices(tool: dict) -> Path | None:
+    package = (tool.get("build") or {}).get("noticesPackage")
+    script = ROOT / "packaging" / "third_party_notices.py"
+    if not package:
+        print("No third-party notices (tool.json build.noticesPackage is empty).")
+        return None
+    if not script.exists():
+        sys.exit(f"{script} is missing: copy packaging/ from the yoraito-desktop template.")
+    out = STAGE / "THIRD-PARTY-NOTICES.txt"
+    run([sys.executable, str(script), str(out), "--package", package, "--title", tool["name"], "--electron"], ROOT)
+    return out
+
+
+def builder_config(tool: dict, notices: Path | None) -> Path:
+    """electron-builder's settings, made from tool.json, so there is no second place to keep in step."""
+    backend = f"{tool['id']}-backend"
+    resources = [{"from": f"stage/backend/{backend}", "to": f"backend/{backend}"}]
+    if notices:
+        resources.append({"from": "stage/THIRD-PARTY-NOTICES.txt", "to": "THIRD-PARTY-NOTICES.txt"})
+    config = {
+        "appId": tool["appId"],
+        "productName": tool["name"],
+        "directories": {"output": str(RELEASE), "buildResources": "assets"},
+        "files": ["main.js", "preload.js", "loading.html", "tool.json", "assets/**", "package.json"],
+        "extraResources": resources,
+        "extraMetadata": {"name": tool["id"], "version": tool["version"], "description": tool.get("description", "")},
+        "asar": True,
+        "win": {"target": [{"target": "nsis", "arch": ["x64"]}], "icon": "assets/icon.ico"},
+        "nsis": {
+            "oneClick": False,
+            "perMachine": False,  # installs for the current user: no administrator rights needed
+            "allowToChangeInstallationDirectory": True,
+            "artifactName": f"{tool['id']}-setup-${{version}}.${{ext}}",
+            "deleteAppDataOnUninstall": False,  # the user's data in ~/.yoraito stays
+        },
+    }
+    path = STAGE / "electron-builder.json"
+    path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+    return path
+
+
+def build_installer(tool: dict, notices: Path | None) -> Path:
     if not (DESKTOP / "node_modules" / "electron-builder").exists():
         run([NPM, "ci"], DESKTOP)
     shutil.rmtree(RELEASE, ignore_errors=True)
-    run([NPX, "electron-builder", "--win", "nsis", "--x64", "--publish", "never"], DESKTOP)
-    version = json.loads((DESKTOP / "package.json").read_text(encoding="utf-8"))["version"]
-    installer = RELEASE / f"Yoraito-Setup-{version}.exe"
+    config = builder_config(tool, notices)
+    run([NPX, "electron-builder", "--config", str(config), "--win", "nsis", "--x64", "--publish", "never"], DESKTOP)
+    installer = RELEASE / f"{tool['id']}-setup-{tool['version']}.exe"
     if not installer.exists():
         sys.exit(f"The installer was not created: {installer} is missing.")
     return installer
@@ -93,62 +158,41 @@ def write_checksum(installer: Path) -> str:
     return value
 
 
-def write_docs(installer: Path, checksum: str) -> None:
-    """RELEASE_NOTES.md and INSTALL.md next to the installer (regenerated on every build)."""
-    version = json.loads((DESKTOP / "package.json").read_text(encoding="utf-8"))["version"]
-    size_mb = installer.stat().st_size / (1024 * 1024)
+def write_release_notes(tool: dict, installer: Path, checksum: str) -> None:
+    size = installer.stat().st_size
     (RELEASE / "RELEASE_NOTES.md").write_text(
-        f"""# Yoraito {version} for Windows
+        f"""# {tool['name']} {tool['version']} for Windows
 
-* Installer: `{installer.name}` ({installer.stat().st_size:,} bytes, {size_mb:.0f} MB)
-* Architecture: Windows 10/11, 64-bit (x64)
-* SHA-256: `{checksum}`
-* Not code-signed yet: Windows SmartScreen shows "Windows protected your PC". Click **More info**, then **Run anyway**.
+{tool.get('description', '')}
 
-## What it does
-Compare two versions of an Excel financial model. The new file opens in Excel with the changes coloured in
-(green added, amber changed, red removed) and a "Diff summary" sheet listing every change. Earlier comparisons
-stay in the list after you close and reopen Yoraito.
-
-## Privacy
-Everything runs on your computer. The app can only talk to its own engine on 127.0.0.1; every other network
-request is blocked. AI summaries and Google-Sheets-by-URL are switched off. Comparing works with no internet.
-
-## Your data
-`%LOCALAPPDATA%\\Yoraito\\` holds `reviews.db`, `review_files\\` and `logs\\`. Uninstalling does not delete it.
-History from the earlier one-file program (`%LOCALAPPDATA%\\yoraito-model-diff\\`) is copied in on first run.
-""",
-        encoding="utf-8",
-    )
-    (RELEASE / "INSTALL.md").write_text(
-        f"""# Install Yoraito {version}
-
-1. Double-click `{installer.name}`. If Windows says "Windows protected your PC", click **More info**, then **Run anyway**.
-2. Follow the wizard. No administrator rights are needed; it installs for your user only.
-3. Open **Yoraito** from the Start menu or the desktop shortcut.
-4. Choose the earlier version (BEFORE) and the new version (AFTER), then click **Compare versions**.
-
-Verify the download (PowerShell): `Get-FileHash .\\{installer.name} -Algorithm SHA256` must equal `{checksum}`.
-
-Back up your history: close Yoraito and copy `%LOCALAPPDATA%\\Yoraito`. Remove all data: delete that folder.
-Uninstall: Settings, Apps, Yoraito, Uninstall (your data is kept).
+* Installer: `{installer.name}` ({size:,} bytes, {size / (1024 * 1024):.0f} MB), Windows 10/11, 64-bit
+* SHA-256: `{checksum}`. Check it in PowerShell: `Get-FileHash .\\{installer.name} -Algorithm SHA256`
+* Installs for the current user; no administrator rights needed.
+* Data: `%USERPROFILE%\\.yoraito\\{tool['id']}\\` (or `%YORAITO_HOME%\\{tool['id']}\\`). Uninstalling keeps it.
+* If the installer isn't code-signed yet, Windows SmartScreen shows "Windows protected your PC": click
+  **More info**, then **Run anyway**.
 """,
         encoding="utf-8",
     )
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Build the Yoraito Windows installer.")
-    ap.add_argument("--skip-frontend", action="store_true", help="reuse the already built React UI")
+    ap = argparse.ArgumentParser(description="Build a Yoraito tool's Windows installer from desktop/tool.json.")
+    ap.add_argument("--skip-frontend", action="store_true", help="reuse the already built web frontend")
     ap.add_argument("--skip-backend", action="store_true", help="reuse the already built backend (desktop/stage)")
     args = ap.parse_args()
+    tool = load_tool()
+    if not (DESKTOP / "assets" / "icon.ico").exists():
+        sys.exit("desktop/assets/icon.ico is missing: run desktop/make_icon.py, or add the tool's icon.")
+    STAGE.mkdir(exist_ok=True)
     if not args.skip_frontend:
-        build_frontend()
+        build_frontend(tool)
     if not args.skip_backend:
-        build_backend()
-    installer = build_installer()
+        build_backend(tool)
+    notices = write_notices(tool)
+    installer = build_installer(tool, notices)
     checksum = write_checksum(installer)
-    write_docs(installer, checksum)
+    write_release_notes(tool, installer, checksum)
     print("\nInstaller:", installer)
     print("Size     :", f"{installer.stat().st_size:,} bytes")
     print("SHA-256  :", checksum)

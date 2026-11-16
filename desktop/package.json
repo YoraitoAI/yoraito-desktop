@@ -1,0 +1,15 @@
+{
+  "name": "yoraito-desktop-shell",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Yoraito desktop shell: a tool's local web app in its own window. Name and version come from tool.json at build time.",
+  "main": "main.js",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "44.10.1",
+    "electron-builder": "26.18.0"
+  }
+}

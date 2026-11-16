@@ -1,57 +1,86 @@
-; Inno Setup script for yoraito-sync
-; Build from the repository root after PyInstaller: iscc packaging\yoraito-sync.iss
-;   (scripts/build-windows.sh does both; it passes /DAppVersion=<version>)
-; Output: dist\yoraito-sync-setup.exe
+; Inno Setup installer for a Yoraito tool that ships as one exe, without Electron (yoraito-sync is one).
+; Electron tools don't need this file: desktop/build_desktop.py makes their installer.
+;
+; 1. Copy this file to packaging/installer.iss in the tool's repository and fill in the defines below.
+; 2. Build the exe (PyInstaller) to dist\<ToolId>.exe, and the notices to dist\THIRD-PARTY-NOTICES.txt:
+;      python packaging/third_party_notices.py dist/THIRD-PARTY-NOTICES.txt --package <python package>
+; 3. From the repository root: iscc /DAppVersion=<version> packaging\installer.iss
+;    Output: dist\<ToolId>-setup.exe
 
+; ---- fill these in ------------------------------------------------------------------------------------------
+; AppId identifies the install for upgrades and uninstall. Make a new GUID for each tool (Inno Setup IDE: Tools >
+; Generate GUID, or PowerShell: [guid]::NewGuid()) and keep the two opening braces: "{{XXXXXXXX-...}". Never reuse
+; another tool's id, and never change it after the first release: a different id installs a second copy.
+#define AppId "__APP_ID__"
+; The name people see: Start menu, Apps & features, the install folder.
+#define AppName "__TOOL_NAME__"
+; Lowercase and hyphenated, as in tool.json "id". The exe is dist\<ToolId>.exe.
+#define ToolId "__TOOL_ID__"
+; "yes" adds an optional "Start <AppName> when I sign in to Windows" task, for tools that run in the background.
+#define StartupTask "no"
+; -------------------------------------------------------------------------------------------------------------
+
+#if AppId == "__APP_ID__"
+  #error Set AppId to a new GUID for this tool (see the comment above it).
+#endif
+#if AppId == "{{250E2FB3-6817-4325-BAFD-99836FE91077}"
+  #error That AppId is Yoraito Sync's. Every tool needs its own.
+#endif
+#if AppName == "__TOOL_NAME__" || ToolId == "__TOOL_ID__"
+  #error Fill in AppName and ToolId.
+#endif
 #ifndef AppVersion
   #define AppVersion "0.1.0"
 #endif
 
 [Setup]
-; AppId identifies the install for upgrades and uninstall. Never change it: a new id would
-; install a second copy next to the old one instead of upgrading it.
-AppId={{250E2FB3-6817-4325-BAFD-99836FE91077}
-AppName=__TOOL_NAME__
+AppId={#AppId}
+AppName={#AppName}
 AppVersion={#AppVersion}
-AppVerName=__TOOL_NAME__ {#AppVersion}
+AppVerName={#AppName} {#AppVersion}
 WizardStyle=modern
-; An upgrade or uninstall first asks a running Yoraito Sync to close.
+; An upgrade or uninstall first asks the running program to close.
 CloseApplications=yes
 AppPublisher=Yoraito
 AppPublisherURL=https://yoraito.ai
 ; Relative paths below are from the repository root, not from this folder.
 SourceDir=..
-DefaultDirName={autopf}\Yoraito Sync
-DefaultGroupName=__TOOL_NAME__
+DefaultDirName={autopf}\{#AppName}
+DefaultGroupName={#AppName}
 OutputDir=dist
-OutputBaseFilename=__TOOL_NAME_LOWER__-setup
+OutputBaseFilename={#ToolId}-setup
 Compression=lzma2
 SolidCompression=yes
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
+; Installs for the current user: no administrator rights needed.
 PrivilegesRequired=lowest
-UninstallDisplayIcon={app}\__TOOL_NAME_LOWER__.exe
+UninstallDisplayIcon={app}\{#ToolId}.exe
 
 [Files]
-Source: "dist\yoraito-sync.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "packaging\README.txt"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\{#ToolId}.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\THIRD-PARTY-NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion
+; Optional: a plain-text read-me for the install folder.
+Source: "packaging\README.txt"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Icons]
-Name: "{group}\__TOOL_NAME__"; Filename: "{app}\__TOOL_NAME_LOWER__.exe"
-Name: "{group}\Read me"; Filename: "{app}\README.txt"
-Name: "{group}\Uninstall Yoraito Sync"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\__TOOL_NAME__"; Filename: "{app}\__TOOL_NAME_LOWER__.exe"; Tasks: desktopicon
+Name: "{group}\{#AppName}"; Filename: "{app}\{#ToolId}.exe"
+Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#ToolId}.exe"; Tasks: desktopicon
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional icons:"
-Name: "startup"; Description: "Start Yoraito Sync when I sign in to Windows"; GroupDescription: "Startup:"
+#if StartupTask == "yes"
+Name: "startup"; Description: "Start {#AppName} when I sign in to Windows"; GroupDescription: "Startup:"; Flags: unchecked
+#endif
 
+#if StartupTask == "yes"
 [Registry]
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "__TOOL_NAME_PASCAL__"; ValueData: """{app}\__TOOL_NAME_LOWER__.exe"""; Flags: uninsdeletevalue; Tasks: startup
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "{#ToolId}"; ValueData: """{app}\{#ToolId}.exe"""; Flags: uninsdeletevalue; Tasks: startup
+#endif
 
 [Run]
-Filename: "{app}\__TOOL_NAME_LOWER__.exe"; Description: "Launch Yoraito Sync"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#ToolId}.exe"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent
 
-; No [UninstallDelete]: the ledger, settings and sync history in %USERPROFILE%\.yoraito are the
-; user's data and are shared with other Yoraito tools, so uninstalling keeps them (see README.txt).
+; No [UninstallDelete]: the tool's data in %USERPROFILE%\.yoraito\<ToolId> (or %YORAITO_HOME%) belongs to the
+; user and may be shared with other Yoraito tools, so uninstalling keeps it.

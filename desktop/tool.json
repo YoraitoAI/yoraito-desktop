@@ -1,0 +1,27 @@
+{
+  "name": "Yoraito Example",
+  "id": "yoraito-example",
+  "appId": "ai.yoraito.example",
+  "version": "0.1.0",
+  "description": "A small web app, to try the desktop template.",
+  "port": 0,
+  "healthPath": "/api/health",
+  "externalLinks": [],
+  "crashMessage": "Your data on this computer is safe.",
+  "backend": {
+    "app": "example.hello_app:app",
+    "factory": false,
+    "blockedRoutes": [],
+    "scrubEnv": [],
+    "env": {},
+    "legacyDataDirs": []
+  },
+  "build": {
+    "pythonPaths": ["."],
+    "addData": [],
+    "hiddenImports": ["example.hello_app"],
+    "collectSubmodules": ["uvicorn"],
+    "frontend": null,
+    "noticesPackage": null
+  }
+}

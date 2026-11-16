@@ -1,35 +1,67 @@
 "use strict";
 /**
- * Yoraito desktop shell (Electron main process).
+ * Yoraito desktop shell (Electron main process). The same file for every tool: everything that differs
+ * between tools is in tool.json next to this file (see PLACEHOLDERS.md).
  *
  * What it does, in order:
- *   1. makes sure only one Yoraito is running;
- *   2. picks a free local port and starts the bundled Python backend on 127.0.0.1;
- *   3. waits for GET /api/health, then shows the interface the backend serves;
- *   4. stops the backend when the app closes, and tells the user if the backend stops by itself.
+ *   1. makes sure only one copy of this tool is running (each tool has its own lock);
+ *   2. starts the bundled Python backend on 127.0.0.1, on the tool's fixed port or a free one;
+ *   3. waits for the backend's health route, then shows the interface the backend serves;
+ *   4. asks the backend to stop when the app closes (and ends it if it doesn't), and tells the user if the
+ *      backend stops by itself.
  *
- * Privacy: the window may only talk to its own backend on 127.0.0.1. Every other network request is cancelled.
+ * Privacy: the window may only talk to its own backend on 127.0.0.1. Every other request is cancelled. Links the
+ * tool lists in tool.json "externalLinks" open in the user's own browser, and only when the page asks.
  */
 const { app, BrowserWindow, Menu, dialog, ipcMain, session, shell } = require("electron");
 const { spawn, spawnSync } = require("node:child_process");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const http = require("node:http");
 const net = require("node:net");
+const os = require("node:os");
 const path = require("node:path");
+const { pathToFileURL } = require("node:url");
 
 const HOST = "127.0.0.1";
 const HEALTH_TIMEOUT_MS = 60_000;
-const EXTERNAL_ALLOWED = new Set(["https://sheets.new/"]); // opened in the user's browser, only on request
+const SHUTDOWN_WAIT_MS = 5_000;
 
-const dataDir = path.join(process.env.LOCALAPPDATA || app.getPath("home"), "Yoraito");
+const tool = loadTool();
+// The same layout as yoraito-core's paths: YORAITO_HOME (default ~/.yoraito), one folder per tool.
+const dataDir = path.join(process.env.YORAITO_HOME || path.join(os.homedir(), ".yoraito"), tool.id);
 const logDir = path.join(dataDir, "logs");
 fs.mkdirSync(logDir, { recursive: true });
-app.setPath("userData", path.join(dataDir, "electron")); // Chromium's own cache lives with the rest of the data
+// Chromium's profile, and with it the single-instance lock, is per tool, so two Yoraito tools can run at once.
+app.setPath("userData", path.join(dataDir, "electron"));
+
+const loadingPage = path.join(__dirname, "loading.html");
+const loadingUrl = pathToFileURL(loadingPage).href;
+const shutdownToken = crypto.randomBytes(24).toString("hex");
 
 let backend = null; // the child process
 let backendPort = 0;
 let mainWindow = null;
 let quitting = false;
+let stopping = false;
+
+function loadTool() {
+  const raw = JSON.parse(fs.readFileSync(path.join(__dirname, "tool.json"), "utf8"));
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(raw.id || "")) throw new Error('tool.json: "id" must be lowercase letters, digits and hyphens');
+  if (!raw.name) throw new Error('tool.json: "name" is required');
+  const port = Number(raw.port || 0);
+  if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('tool.json: "port" must be 0 or a port number');
+  const links = (raw.externalLinks || []).map(String);
+  if (links.some((link) => !link.startsWith("https://"))) throw new Error('tool.json: "externalLinks" must be https:// URLs');
+  return {
+    id: raw.id,
+    name: raw.name,
+    port,
+    healthPath: raw.healthPath || "/api/health",
+    externalLinks: links,
+    crashMessage: raw.crashMessage || "Your data on this computer is safe.",
+  };
+}
 
 function log(message) {
   try {
@@ -39,7 +71,7 @@ function log(message) {
   }
 }
 
-// ---- one instance only ------------------------------------------------------------------------------------
+// ---- one instance of this tool only -----------------------------------------------------------------------
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
@@ -49,15 +81,23 @@ if (!app.requestSingleInstanceLock()) {
       mainWindow.focus();
     }
   });
-  app.whenReady().then(start).catch((err) => fatal(`Yoraito could not start.\n\n${err && err.message ? err.message : err}`));
+  app.whenReady().then(start).catch((err) => fatal(`${tool.name} could not start.\n\n${err && err.message ? err.message : err}`));
 }
 
 // ---- backend ----------------------------------------------------------------------------------------------
 function backendExecutable() {
-  const base = app.isPackaged
-    ? path.join(process.resourcesPath, "backend")
-    : path.join(__dirname, "stage", "backend", "yoraito-backend");
-  return app.isPackaged ? path.join(base, "yoraito-backend", "yoraito-backend.exe") : path.join(base, "yoraito-backend.exe");
+  const name = `${tool.id}-backend`;
+  const exe = process.platform === "win32" ? `${name}.exe` : name;
+  const base = app.isPackaged ? path.join(process.resourcesPath, "backend") : path.join(__dirname, "stage", "backend");
+  return path.join(base, name, exe);
+}
+
+function portIsFree(port) {
+  return new Promise((resolve) => {
+    const server = net.createServer();
+    server.once("error", () => resolve(false));
+    server.listen(port, HOST, () => server.close(() => resolve(true)));
+  });
 }
 
 function freePort() {
@@ -71,15 +111,32 @@ function freePort() {
   });
 }
 
+async function choosePort() {
+  if (!tool.port) return freePort();
+  // A fixed port: workbooks, AI client settings or registered sign-in addresses point at it.
+  if (!(await portIsFree(tool.port))) {
+    throw new Error(`Port ${tool.port} is in use by another program, and ${tool.name} needs that port.\n` +
+      "Close the other program (or the copy of this tool started outside the desktop app) and try again.");
+  }
+  return tool.port;
+}
+
 function startBackend(port) {
   const exe = backendExecutable();
-  if (!fs.existsSync(exe)) throw new Error(`The Yoraito engine is missing:\n${exe}`);
+  if (!fs.existsSync(exe)) throw new Error(`The ${tool.name} engine is missing:\n${exe}`);
   const out = fs.openSync(path.join(logDir, "backend-output.log"), "a");
   backend = spawn(exe, [], {
     cwd: path.dirname(exe),
     windowsHide: true,
     stdio: ["ignore", out, out],
-    env: { ...process.env, YORAITO_PORT: String(port), YORAITO_PARENT_PID: String(process.pid) },
+    env: {
+      ...process.env,
+      YORAITO_DESKTOP: "1",
+      YORAITO_PORT: String(port),
+      YORAITO_DATA_DIR: dataDir,
+      YORAITO_PARENT_PID: String(process.pid),
+      YORAITO_SHUTDOWN_TOKEN: shutdownToken,
+    },
   });
   log(`backend started pid=${backend.pid} port=${port}`);
   backend.on("exit", (code, signal) => {
@@ -89,35 +146,55 @@ function startBackend(port) {
   });
 }
 
-function stopBackend() {
+function forceStop() {
   if (!backend) return;
   const pid = backend.pid;
-  backend = null;
   try {
     if (process.platform === "win32") {
       // /T also ends anything the backend started; /F because it has no console to receive a polite request.
       spawnSync("taskkill", ["/pid", String(pid), "/T", "/F"], { windowsHide: true });
     } else {
-      process.kill(pid, "SIGTERM");
+      process.kill(pid, "SIGKILL");
     }
   } catch (err) {
-    log(`stopBackend: ${err.message}`);
+    log(`forceStop: ${err.message}`);
   }
-  log(`backend stopped pid=${pid}`);
+  log(`backend force-stopped pid=${pid}`);
+}
+
+function askBackendToStop() {
+  return new Promise((resolve) => {
+    const req = http.request(
+      { host: HOST, port: backendPort, path: "/__desktop/shutdown", method: "POST", timeout: 2000,
+        headers: { "X-Yoraito-Shutdown": shutdownToken, "Content-Length": 0 } },
+      (res) => { res.resume(); resolve(res.statusCode === 202); },
+    );
+    req.on("error", () => resolve(false));
+    req.on("timeout", () => { req.destroy(); resolve(false); });
+    req.end();
+  });
+}
+
+async function stopBackend() {
+  if (!backend) return;
+  const child = backend;
+  // Let the backend finish what it is writing (its ASGI shutdown runs), then end it if it hasn't stopped.
+  const exited = new Promise((resolve) => child.once("exit", () => resolve(true)));
+  if (await askBackendToStop()) {
+    const stopped = await Promise.race([exited, new Promise((r) => setTimeout(() => r(false), SHUTDOWN_WAIT_MS))]);
+    if (stopped) {
+      log("backend stopped");
+      return;
+    }
+  }
+  forceStop();
 }
 
 function healthy(port) {
   return new Promise((resolve) => {
-    const req = http.get({ host: HOST, port, path: "/api/health", timeout: 1500 }, (res) => {
-      let body = "";
-      res.on("data", (chunk) => (body += chunk));
-      res.on("end", () => {
-        try {
-          resolve(res.statusCode === 200 && JSON.parse(body).status === "ok");
-        } catch {
-          resolve(false);
-        }
-      });
+    const req = http.get({ host: HOST, port, path: tool.healthPath, timeout: 1500 }, (res) => {
+      res.resume();
+      resolve(res.statusCode === 200);
     });
     req.on("error", () => resolve(false));
     req.on("timeout", () => {
@@ -130,21 +207,21 @@ function healthy(port) {
 async function waitForBackend(port) {
   const deadline = Date.now() + HEALTH_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    if (!backend) throw new Error("The Yoraito engine stopped while starting.");
+    if (!backend) throw new Error(`The ${tool.name} engine stopped while starting.`);
     if (await healthy(port)) return;
     await new Promise((r) => setTimeout(r, 300));
   }
-  throw new Error("The Yoraito engine did not start within 60 seconds.");
+  throw new Error(`The ${tool.name} engine did not start within 60 seconds.`);
 }
 
 function onBackendLost(code) {
   if (quitting) return;
   const choice = dialog.showMessageBoxSync(mainWindow || undefined, {
     type: "error",
-    title: "Yoraito",
-    message: "The Yoraito engine stopped unexpectedly.",
-    detail: `Your saved comparisons are safe.\nExit code: ${code}\nLog folder: ${logDir}`,
-    buttons: ["Restart Yoraito", "Close"],
+    title: tool.name,
+    message: `The ${tool.name} engine stopped unexpectedly.`,
+    detail: `${tool.crashMessage}\nExit code: ${code}\nLog folder: ${logDir}`,
+    buttons: [`Restart ${tool.name}`, "Close"],
     defaultId: 0,
     cancelId: 1,
   });
@@ -157,9 +234,9 @@ function onBackendLost(code) {
 
 function fatal(message) {
   log(`fatal: ${message}`);
-  dialog.showErrorBox("Yoraito could not start", `${message}\n\nLog folder: ${logDir}`);
+  dialog.showErrorBox(`${tool.name} could not start`, `${message}\n\nLog folder: ${logDir}`);
   quitting = true;
-  stopBackend();
+  forceStop();
   app.exit(1);
 }
 
@@ -173,12 +250,21 @@ function isOurOrigin(url) {
   }
 }
 
+function isExternalAllowed(url) {
+  return tool.externalLinks.some((prefix) => url === prefix || url.startsWith(prefix));
+}
+
 function lockDownSession(ses) {
-  // 1. Nothing but our own backend (and the local loading page) may be requested.
+  // 1. Nothing but our own backend and the local loading page may be requested.
   ses.webRequest.onBeforeRequest((details, callback) => {
     const url = details.url;
-    const allowed = isOurOrigin(url) || url.startsWith("file:") || url.startsWith("devtools:") || url.startsWith("blob:") || url.startsWith("data:");
-    if (!allowed) log(`blocked request ${details.method} ${new URL(url).origin}`);
+    const allowed = isOurOrigin(url) || url === loadingUrl || url.startsWith("devtools:") ||
+      url.startsWith("blob:") || url.startsWith("data:");
+    if (!allowed) {
+      let origin = url;
+      try { origin = new URL(url).origin; } catch { /* keep the raw text */ }
+      log(`blocked request ${details.method} ${origin}`);
+    }
     callback({ cancel: !allowed });
   });
   // 2. A strict Content-Security-Policy on everything the backend serves.
@@ -200,14 +286,12 @@ function lockDownSession(ses) {
 
 function lockDownContents(contents) {
   contents.on("will-navigate", (event, url) => {
-    if (!isOurOrigin(url) && !url.startsWith("file:")) event.preventDefault();
+    if (!isOurOrigin(url) && url !== loadingUrl) event.preventDefault();
   });
   contents.setWindowOpenHandler(({ url }) => {
-    // The UI opens a blank tab, then points it at Google Sheets for the "Open in Google Sheets" button.
-    // Both end up as one request to open https://sheets.new in the user's own browser.
-    if (url === "about:blank" || EXTERNAL_ALLOWED.has(url)) {
-      shell.openExternal("https://sheets.new/");
-    }
+    // window.open() and target="_blank" links: only the tool's listed https links, in the user's own browser.
+    if (isExternalAllowed(url)) shell.openExternal(url);
+    else log(`blocked window ${url.slice(0, 120)}`);
     return { action: "deny" };
   });
   contents.on("will-attach-webview", (event) => event.preventDefault());
@@ -220,7 +304,7 @@ function trusted(event) {
 }
 ipcMain.handle("yoraito:app-info", (event) => {
   if (!trusted(event)) throw new Error("Not allowed.");
-  return { version: app.getVersion(), dataFolder: dataDir };
+  return { name: tool.name, version: app.getVersion(), dataFolder: dataDir };
 });
 ipcMain.handle("yoraito:open-data-folder", async (event) => {
   if (!trusted(event)) throw new Error("Not allowed.");
@@ -235,7 +319,7 @@ function createWindow() {
     minWidth: 900,
     minHeight: 600,
     show: false,
-    title: "Yoraito",
+    title: tool.name,
     backgroundColor: "#ffffff",
     icon: path.join(__dirname, "assets", "icon.ico"),
     webPreferences: {
@@ -270,17 +354,17 @@ function buildMenu() {
         ],
       },
       { label: "View", submenu: [{ role: "reload" }, { role: "resetZoom" }, { role: "zoomIn" }, { role: "zoomOut" }, { role: "togglefullscreen" }] },
-      { label: "Help", submenu: [{ label: `Yoraito ${app.getVersion()} - your files stay on this computer`, enabled: false }] },
+      { label: "Help", submenu: [{ label: `${tool.name} ${app.getVersion()} - your data stays on this computer`, enabled: false }] },
     ]),
   );
 }
 
 async function start() {
-  log(`Yoraito ${app.getVersion()} starting (packaged=${app.isPackaged})`);
+  log(`${tool.name} ${app.getVersion()} starting (packaged=${app.isPackaged})`);
   buildMenu();
   mainWindow = createWindow();
-  mainWindow.loadFile(path.join(__dirname, "loading.html"));
-  backendPort = await freePort();
+  mainWindow.loadFile(loadingPage);
+  backendPort = await choosePort();
   lockDownSession(session.defaultSession);
   startBackend(backendPort);
   await waitForBackend(backendPort);
@@ -288,9 +372,14 @@ async function start() {
   await mainWindow.loadURL(`http://${HOST}:${backendPort}/`);
 }
 
-app.on("before-quit", () => {
+app.on("before-quit", (event) => {
   quitting = true;
-  stopBackend();
+  if (backend && !stopping) {
+    // Quit once the backend has stopped, so it can finish writing first.
+    event.preventDefault();
+    stopping = true;
+    stopBackend().finally(() => app.quit());
+  }
 });
 app.on("window-all-closed", () => app.quit());
-process.on("exit", stopBackend);
+process.on("exit", forceStop); // last resort if Electron goes away without before-quit

@@ -1,48 +1,44 @@
-# yoraito-desktop — Shared Desktop App Packaging Template
+# yoraito-desktop
 
-This repository contains the shared desktop application packaging framework for all Yoraito tools.
+The shared Windows packaging for Yoraito tools. There are two ways to ship a tool, depending on what it is:
 
-Each Yoraito tool (model-diff, recon, sync, etc.) copies this template into its own `desktop/` directory and customizes it.
-
-## What's Included
-
-- **Electron shell** — loads the local web app in a native window
-- **PyInstaller entry point** — wraps the FastAPI backend for distribution
-- **NSIS installer config** — Windows installer with upgrade support
-- **Build scripts** — one-command build for exe + installer
-- **Documentation** — step-by-step packaging guide
-
-## How to Use
-
-1. Copy this template into your tool's `desktop/` directory
-2. Replace placeholders (see `PLACEHOLDERS.md`)
-3. Run `python build_desktop.py`
-4. Output: `desktop/dist/Yoraito-Setup-<version>.exe`
-
-## Placeholders
-
-| Placeholder | Description | Example |
+| Kind of tool | What to copy | Installer |
 |---|---|---|
-| `{{TOOL_NAME}}` | Display name | Yoraito Model Diff |
-| `{{TOOL_NAME_LOWER}}` | Lowercase, hyphenated | yoraito-model-diff |
-| `{{TOOL_NAME_PASCAL}}` | PascalCase | YoraitoModelDiff |
-| `{{PORT}}` | Default port | 17842 |
-| `{{LEGACY_FOLDER}}` | Old data folder name | yoraito-model-diff |
-| `{{APP_FOLDER}}` | New data folder name | Yoraito |
-| `{{ENTRY_MODULE}}` | Python module path | yoraito_model_diff.web.app |
-| `{{CLI_COMMAND}}` | CLI command name | yoraito-model-diff |
+| A web app in its own window (model-diff, recon) | `desktop/` and `packaging/third_party_notices.py` | NSIS, made by electron-builder from `desktop/tool.json` |
+| One exe with its own window or tray icon, no Electron (yoraito-sync) | `packaging/` | Inno Setup, from `packaging/installer.iss.template` |
 
-## Files
+## A web app in its own window (Electron)
 
-- `desktop/main.js` — Electron main process
-- `desktop/preload.js` — Preload script (IPC, security)
-- `desktop/desktop_entry.py` — PyInstaller backend entry point
-- `desktop/build_desktop.py` — Build script (PyInstaller + NSIS)
-- `desktop/electron-builder.yml` — Electron builder config
-- `desktop/loading.html` — Loading screen
-- `packaging/*.iss` — Inno Setup installer template
-- `docs/DESKTOP.md` — Packaging guide
+The code in `desktop/` is the same for every tool. What differs is in one file, `desktop/tool.json`: the tool's name, id, port, health route, the links it may open, and how to package its backend.
+
+1. Copy `desktop/` into the tool's repository as `desktop/`, and `packaging/third_party_notices.py` as `packaging/third_party_notices.py`.
+2. Edit `desktop/tool.json` (every field is described in [PLACEHOLDERS.md](PLACEHOLDERS.md)). Replace `desktop/assets/icon.ico` with the tool's icon, or keep the placeholder.
+3. In the tool's Python environment, with PyInstaller installed: `python desktop/build_desktop.py`
+4. The installer, its checksum and short release notes are in `release/`.
+
+The backend has to follow a short contract: an ASGI app, a health route, background work in its lifespan. See [docs/DESKTOP.md](docs/DESKTOP.md).
+
+To try the template as it is, `example/hello_app.py` is a minimal backend, and `desktop/tool.json` points at it:
+
+```
+pip install fastapi uvicorn "pyinstaller>=6"
+python desktop/build_desktop.py
+```
+
+## One exe without Electron (Inno Setup)
+
+1. Copy `packaging/installer.iss.template` to `packaging/installer.iss` in the tool's repository and fill in the four `#define` lines at the top. `AppId` must be a new GUID; the script refuses to compile with the placeholder or with Yoraito Sync's id.
+2. Build the exe to `dist\<ToolId>.exe`, and the notices with `python packaging/third_party_notices.py dist/THIRD-PARTY-NOTICES.txt --package <python package>`.
+3. `iscc /DAppVersion=<version> packaging\installer.iss` writes `dist\<ToolId>-setup.exe`.
+
+## Getting later fixes
+
+Tools copy these files, so a fix here doesn't reach them by itself. Because everything tool-specific is in `desktop/tool.json` (or the `#define` block of `installer.iss`), updating a tool means copying the other files again; nothing in them needs editing. A Copier template or versioned packages would automate that later.
+
+## Data
+
+Every tool keeps its data in its own folder, `%USERPROFILE%\.yoraito\<id>` (or `%YORAITO_HOME%\<id>`): the layout yoraito-core's `paths` module uses. Electron's own profile and the logs are in that folder too, so two Yoraito tools can run side by side. Uninstalling keeps the folder.
 
 ## License
 
-MIT License. Part of the Yoraito open-source finance stack.
+MIT, see [LICENSE](LICENSE).
