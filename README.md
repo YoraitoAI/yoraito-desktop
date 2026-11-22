@@ -46,3 +46,5 @@ MIT, see [LICENSE](LICENSE).
 ## Yoraito Core
 
 No core code belongs in this template. Document the packaging contract against `yoraito_core.paths` and `yoraito_core.installkey` so every tool uses the same data folder and per-install key. See `yoraito-core/docs/ADOPTION.md` and `docs/GENERICITY.md`.
+
+See [docs/CORE-CONTRACT.md](docs/CORE-CONTRACT.md) for the contract a tool must provide.
