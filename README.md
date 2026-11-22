@@ -42,3 +42,7 @@ Every tool keeps its data in its own folder, `%USERPROFILE%\.yoraito\<id>` (or `
 ## License
 
 MIT, see [LICENSE](LICENSE).
+
+## Yoraito Core
+
+No core code belongs in this template. Document the packaging contract against `yoraito_core.paths` and `yoraito_core.installkey` so every tool uses the same data folder and per-install key. See `yoraito-core/docs/ADOPTION.md` and `docs/GENERICITY.md`.
